@@ -14,7 +14,6 @@ const NAV_ITEMS = [
     { id: 'kanban',    label: '⬜ Kanban',    href: 'kanban.html' },
     { id: 'timeline',  label: '⬜ Timeline',   href: 'timeline.html' },
     { id: 'churn',     label: '↺ Churn',      href: 'churn.html' },
-    { id: 'dependency', label: '🕸 Dependency', href: 'dependency.html' },
     { id: 'shares',    label: '🔗 Shares',     href: 'shares.html' },
     { id: 'risk',      label: '⚠ Risk',       href: 'risk.html' },
     { id: 'settings',  label: '⚙ Settings',   href: 'settings.html' },
