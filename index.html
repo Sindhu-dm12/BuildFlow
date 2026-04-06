@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>UNCIA — Login</title>
+    <title>Build Flow — Login</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&family=Inter:wght@400;500&display=swap" rel="stylesheet">
     <style>
@@ -244,7 +244,7 @@
 
     <div class="wrapper">
         <div class="brand">
-            <div class="brand-logo">UNCIA</div>
+            <div class="brand-logo">Build Flow</div>
             <div class="brand-sub">Project Risk Intelligence</div>
         </div>
 
@@ -289,10 +289,15 @@
             </form>
         </div>
 
-        <div class="footer">UNCIA v3 · Jira Risk Intelligence</div>
+        <div class="footer">Build Flow · Jira Risk Intelligence</div>
     </div>
 
     <script>
+        // Keep login and app pages on the same host (localhost) for stable session cookies.
+        if (window.location.hostname === '127.0.0.1') {
+            const target = `http://localhost${window.location.port ? `:${window.location.port}` : ''}${window.location.pathname}${window.location.search}${window.location.hash}`;
+            window.location.replace(target);
+        }
         const API_BASE = window.location.origin + '/api';
 
         function switchTab(tab) {
@@ -317,6 +322,7 @@
                 const res = await fetch(`${API_BASE}/auth/login`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',
                     body: JSON.stringify({
                         username: document.getElementById('loginUsername').value,
                         password: document.getElementById('loginPassword').value
@@ -348,6 +354,7 @@
                 const res = await fetch(`${API_BASE}/auth/register`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',
                     body: JSON.stringify({
                         username: document.getElementById('regUsername').value,
                         email: document.getElementById('regEmail').value,
@@ -369,7 +376,7 @@
         }
 
         // Auto-redirect if already logged in
-        fetch(`${API_BASE}/auth/me`).then(r => { if (r.ok) window.location.href = '/dashboard.html'; }).catch(() => {});
+        fetch(`${API_BASE}/auth/me`, { credentials: 'include' }).then(r => { if (r.ok) window.location.href = '/dashboard.html'; }).catch(() => {});
     </script>
 </body>
 </html>

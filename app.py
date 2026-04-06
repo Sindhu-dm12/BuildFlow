@@ -41,7 +41,13 @@ db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'serve_index'
 
-
+@login_manager.unauthorized_handler
+def handle_unauthorized():
+    # API callers must receive 401 JSON, not HTML redirects, otherwise
+    # frontend auth checks can mis-detect session state and bounce pages.
+    if request.path.startswith('/api/'):
+        return jsonify({'error': 'Unauthorized', 'code': 401}), 401
+    return redirect('/')
 # ===== DATABASE MODELS =====
 
 class User(UserMixin, db.Model):
@@ -127,6 +133,34 @@ class DashboardCache(db.Model):
     critical_risks = db.Column(db.Integer, default=0)
     cached_at = db.Column(db.DateTime, default=datetime.utcnow)
     __table_args__ = (db.UniqueConstraint('user_id', 'project_key'),)
+
+
+class ClientShare(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    project_key = db.Column(db.String(50), nullable=False)
+    token = db.Column(db.String(128), unique=True, nullable=False)
+    label = db.Column(db.String(200), nullable=True)
+    show_risks = db.Column(db.Boolean, default=True)
+    show_team = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=True)
+
+    def is_valid(self):
+        return not (self.expires_at and datetime.utcnow() > self.expires_at)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'project_key': self.project_key,
+            'token': self.token,
+            'label': self.label,
+            'show_risks': self.show_risks,
+            'show_team': self.show_team,
+            'created_at': self.created_at.isoformat(),
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
+            'share_url': f'/share/{self.token}'
+        }
 
 
 # ===== LOGIN MANAGER =====
@@ -1401,6 +1435,393 @@ def jira_deep_dive(project_key):
         }), 200
     except RequestException as e:
         return jsonify({'error': f'Jira connection error: {str(e)}'}), 502
+
+
+# ===== DELIVERY INTELLIGENCE FEATURES =====
+
+def _churn_mock(project_key):
+    issues = mock_issues(project_key)
+    churned = []
+    for issue in issues:
+        fields = issue.get('fields', {})
+        status = fields.get('status', {}).get('name', '').lower()
+        is_done = any(s in status for s in ['done', 'closed', 'resolved'])
+        if not is_done:
+            continue
+        score_seed = int(str(issue.get('key', '0')).split('-')[-1])
+        reopen_count = 1 + (score_seed % 3)
+        if score_seed % 4 == 0:
+            churned.append({
+                'key': issue.get('key'),
+                'summary': fields.get('summary', ''),
+                'assignee': fields.get('assignee', {}).get('displayName', 'Unassigned') if fields.get('assignee') else 'Unassigned',
+                'reopen_count': reopen_count,
+                'issue_type': fields.get('issuetype', {}).get('name', 'Task'),
+                'priority': fields.get('priority', {}).get('name', 'Medium')
+            })
+
+    total_done = len([i for i in issues if any(
+        s in i.get('fields', {}).get('status', {}).get('name', '').lower()
+        for s in ['done', 'closed', 'resolved']
+    )])
+    churn_rate = round((len(churned) / total_done * 100), 1) if total_done else 0
+    by_assignee = {}
+    by_type = {}
+    for item in churned:
+        by_assignee[item['assignee']] = by_assignee.get(item['assignee'], 0) + item['reopen_count']
+        by_type[item['issue_type']] = by_type.get(item['issue_type'], 0) + 1
+    churn_index = min(100, round(churn_rate * 1.5 + len(churned) * 0.8, 1))
+    return {
+        'churn_index': churn_index,
+        'churn_rate_pct': churn_rate,
+        'total_issues': len(issues),
+        'total_done': total_done,
+        'churned_count': len(churned),
+        'churned_issues': sorted(churned, key=lambda x: x['reopen_count'], reverse=True),
+        'by_assignee': [{'assignee': k, 'reopens': v} for k, v in sorted(by_assignee.items(), key=lambda x: -x[1])],
+        'by_type': [{'type': k, 'count': v} for k, v in sorted(by_type.items(), key=lambda x: -x[1])],
+        'verdict': 'Critical' if churn_index >= 70 else ('High' if churn_index >= 45 else ('Medium' if churn_index >= 20 else 'Low'))
+    }
+
+
+def _churn_live(project_key):
+    response = jira_search({
+        'jql': f'{project_jql(project_key)} AND statusCategory = Done ORDER BY updated DESC',
+        'maxResults': 200,
+        'fields': 'summary,status,assignee,issuetype,priority,resolutiondate,updated'
+    })
+    if response.status_code != 200:
+        return None, response.status_code
+
+    issues = response.json().get('issues', [])
+    churned = []
+    by_assignee = {}
+    by_type = {}
+    for issue in issues:
+        fields = issue.get('fields', {})
+        resolved = fields.get('resolutiondate')
+        updated = fields.get('updated')
+        if not resolved or not updated:
+            continue
+        try:
+            res_dt = datetime.strptime(resolved[:19], '%Y-%m-%dT%H:%M:%S')
+            upd_dt = datetime.strptime(updated[:19], '%Y-%m-%dT%H:%M:%S')
+        except Exception:
+            continue
+        delta_hours = (upd_dt - res_dt).total_seconds() / 3600
+        if delta_hours <= 1:
+            continue
+        assignee = (fields.get('assignee') or {}).get('displayName', 'Unassigned')
+        issue_type = fields.get('issuetype', {}).get('name', 'Task')
+        churned.append({
+            'key': issue.get('key'),
+            'summary': fields.get('summary', ''),
+            'assignee': assignee,
+            'reopen_count': 1,
+            'issue_type': issue_type,
+            'priority': fields.get('priority', {}).get('name', 'Medium'),
+            'hours_after_resolve': round(delta_hours, 1)
+        })
+        by_assignee[assignee] = by_assignee.get(assignee, 0) + 1
+        by_type[issue_type] = by_type.get(issue_type, 0) + 1
+
+    total_done = len(issues)
+    churn_rate = round((len(churned) / total_done * 100), 1) if total_done else 0
+    churn_index = min(100, round(churn_rate * 1.5 + len(churned) * 0.8, 1))
+    return {
+        'churn_index': churn_index,
+        'churn_rate_pct': churn_rate,
+        'total_issues': total_done,
+        'total_done': total_done,
+        'churned_count': len(churned),
+        'churned_issues': sorted(churned, key=lambda x: x.get('hours_after_resolve', 0), reverse=True),
+        'by_assignee': [{'assignee': k, 'reopens': v} for k, v in sorted(by_assignee.items(), key=lambda x: -x[1])],
+        'by_type': [{'type': k, 'count': v} for k, v in sorted(by_type.items(), key=lambda x: -x[1])],
+        'verdict': 'Critical' if churn_index >= 70 else ('High' if churn_index >= 45 else ('Medium' if churn_index >= 20 else 'Low'))
+    }, None
+
+
+@app.route('/api/churn/<project_key>', methods=['GET'])
+@login_required
+def get_churn_index(project_key):
+    if use_mock_jira():
+        return jsonify({**_churn_mock(project_key), 'mock_mode': True}), 200
+    if not current_user.has_jira_configured() and not jira_oauth_configured():
+        return jsonify({'error': 'Jira not configured'}), 400
+    try:
+        data, err = _churn_live(project_key)
+        if err:
+            return jsonify({'error': 'Failed to fetch churn data', 'jira_status': err}), err
+        return jsonify({**data, 'mock_mode': False}), 200
+    except RequestException as e:
+        return jsonify({'error': str(e)}), 502
+
+
+def _dep_mock(project_keys):
+    nodes = []
+    edges = []
+    all_keys = []
+    for project_key in project_keys:
+        for issue in mock_issues(project_key)[:8]:
+            fields = issue.get('fields', {})
+            key = issue.get('key')
+            all_keys.append(key)
+            nodes.append({
+                'id': key,
+                'label': fields.get('summary', key)[:55],
+                'project': project_key,
+                'status': fields.get('status', {}).get('name', 'To Do'),
+                'priority': fields.get('priority', {}).get('name', 'Medium'),
+                'assignee': (fields.get('assignee') or {}).get('displayName', 'Unassigned')
+            })
+    for idx in range(0, len(all_keys) - 1, 2):
+        src = all_keys[idx]
+        tgt = all_keys[idx + 1]
+        src_proj = src.split('-')[0]
+        tgt_proj = tgt.split('-')[0]
+        edges.append({
+            'source': src,
+            'target': tgt,
+            'type': 'blocks' if idx % 4 == 0 else 'relates to',
+            'cross_proj': src_proj != tgt_proj
+        })
+    return {
+        'nodes': nodes,
+        'edges': edges,
+        'total_nodes': len(nodes),
+        'total_edges': len(edges),
+        'cross_proj_edges': len([e for e in edges if e['cross_proj']]),
+        'blocking_count': len([e for e in edges if 'block' in e['type']]),
+        'projects': project_keys
+    }
+
+
+def _dep_live(project_keys):
+    node_map = {}
+    edges = []
+    for project_key in project_keys:
+        response = jira_search({
+            'jql': f'{project_jql(project_key)} ORDER BY priority DESC',
+            'maxResults': 50,
+            'fields': 'summary,status,priority,assignee,issuelinks'
+        })
+        if response.status_code != 200:
+            continue
+        for issue in response.json().get('issues', []):
+            fields = issue.get('fields', {})
+            key = issue.get('key')
+            node_map[key] = {
+                'id': key,
+                'label': fields.get('summary', key)[:55],
+                'project': project_key,
+                'status': fields.get('status', {}).get('name', 'To Do'),
+                'priority': fields.get('priority', {}).get('name', 'Medium'),
+                'assignee': (fields.get('assignee') or {}).get('displayName', 'Unassigned')
+            }
+            for link in fields.get('issuelinks', []):
+                if link.get('outwardIssue'):
+                    tgt_key = link['outwardIssue']['key']
+                    edges.append({
+                        'source': key,
+                        'target': tgt_key,
+                        'type': link.get('type', {}).get('outward', 'relates to'),
+                        'cross_proj': key.split('-')[0] != tgt_key.split('-')[0]
+                    })
+                if link.get('inwardIssue'):
+                    src_key = link['inwardIssue']['key']
+                    edges.append({
+                        'source': src_key,
+                        'target': key,
+                        'type': link.get('type', {}).get('inward', 'relates to'),
+                        'cross_proj': src_key.split('-')[0] != key.split('-')[0]
+                    })
+    nodes = list(node_map.values())
+    return {
+        'nodes': nodes,
+        'edges': edges,
+        'total_nodes': len(nodes),
+        'total_edges': len(edges),
+        'cross_proj_edges': len([e for e in edges if e['cross_proj']]),
+        'blocking_count': len([e for e in edges if 'block' in e['type']]),
+        'projects': project_keys
+    }
+
+
+@app.route('/api/dependency', methods=['GET'])
+@login_required
+def get_dependency_map():
+    raw = request.args.get('projects', '')
+    keys = [k.strip().upper() for k in raw.split(',') if k.strip()]
+    if not keys:
+        cached = CachedProject.query.filter_by(user_id=current_user.id).all()
+        keys = [c.project_key for c in cached][:6]
+    if not keys:
+        return jsonify({'error': 'No projects specified or cached'}), 400
+    if use_mock_jira():
+        return jsonify({**_dep_mock(keys), 'mock_mode': True}), 200
+    if not current_user.has_jira_configured() and not jira_oauth_configured():
+        return jsonify({'error': 'Jira not configured'}), 400
+    try:
+        return jsonify({**_dep_live(keys), 'mock_mode': False}), 200
+    except RequestException as e:
+        return jsonify({'error': str(e)}), 502
+
+
+@app.route('/api/client/shares', methods=['GET'])
+@login_required
+def list_shares():
+    shares = ClientShare.query.filter_by(user_id=current_user.id).order_by(ClientShare.created_at.desc()).all()
+    return jsonify({'shares': [s.to_dict() for s in shares]}), 200
+
+
+@app.route('/api/client/share', methods=['POST'])
+@login_required
+def create_share():
+    data = request.get_json() or {}
+    project_key = data.get('project_key', '').strip().upper()
+    if not project_key:
+        return jsonify({'error': 'project_key is required'}), 400
+    label = data.get('label', f'Shared - {project_key}')
+    show_risks = bool(data.get('show_risks', True))
+    show_team = bool(data.get('show_team', False))
+    expires_in = data.get('expires_days')
+    token = secrets.token_urlsafe(32)
+    share = ClientShare(
+        user_id=current_user.id,
+        project_key=project_key,
+        token=token,
+        label=label,
+        show_risks=show_risks,
+        show_team=show_team,
+        expires_at=datetime.utcnow() + timedelta(days=int(expires_in)) if expires_in else None
+    )
+    db.session.add(share)
+    db.session.commit()
+    return jsonify({'share': share.to_dict()}), 201
+
+
+@app.route('/api/client/share/<token>', methods=['DELETE'])
+@login_required
+def delete_share(token):
+    share = ClientShare.query.filter_by(token=token, user_id=current_user.id).first()
+    if not share:
+        return jsonify({'error': 'Share not found'}), 404
+    db.session.delete(share)
+    db.session.commit()
+    return jsonify({'message': 'Share deleted'}), 200
+
+
+@app.route('/share/<token>', methods=['GET'])
+def client_share_view(token):
+    share = ClientShare.query.filter_by(token=token).first()
+    if not share or not share.is_valid():
+        return '<h2 style="font-family:sans-serif;padding:2rem">This link has expired or does not exist.</h2>', 404
+    return send_from_directory('files', 'client_share.html')
+
+
+@app.route('/api/share/<token>/data', methods=['GET'])
+def client_share_data(token):
+    share = ClientShare.query.filter_by(token=token).first()
+    if not share or not share.is_valid():
+        return jsonify({'error': 'Invalid or expired share link'}), 403
+
+    owner = User.query.get(share.user_id)
+    if not owner:
+        return jsonify({'error': 'Owner not found'}), 404
+
+    project_key = share.project_key
+    issues = []
+    if owner.has_jira_configured():
+        auth = HTTPBasicAuth(owner.jira_email, owner.jira_api_token)
+        headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+        base = f"https://{owner.jira_domain}/rest/api/3"
+
+        def owner_get(path, params=None):
+            req_session = requests.Session()
+            req_session.trust_env = False
+            return req_session.get(f"{base}{path}", headers=headers, auth=auth, params=params, timeout=15)
+
+        try:
+            response = owner_get('/search', {
+                'jql': f'project = "{project_key}" ORDER BY priority DESC',
+                'maxResults': 100,
+                'fields': 'summary,status,assignee,priority,duedate,issuetype'
+            })
+            if response.status_code == 200:
+                issues = response.json().get('issues', [])
+        except Exception:
+            issues = []
+    if not issues:
+        issues = mock_issues(project_key)
+
+    total = len(issues)
+    done = 0
+    in_prog = 0
+    todo = 0
+    overdue_count = 0
+    priority_dist = {'Critical': 0, 'High': 0, 'Medium': 0, 'Low': 0}
+    for issue in issues:
+        fields = issue.get('fields', {})
+        status_raw = fields.get('status', {}).get('name', '').lower()
+        if any(s in status_raw for s in ['done', 'closed', 'resolved']):
+            done += 1
+        elif any(s in status_raw for s in ['progress', 'review']):
+            in_prog += 1
+        else:
+            todo += 1
+        priority = fields.get('priority', {}).get('name', 'Medium')
+        if priority in priority_dist:
+            priority_dist[priority] += 1
+        due = fields.get('duedate')
+        if due and 'done' not in status_raw:
+            try:
+                if datetime.strptime(due, '%Y-%m-%d') < datetime.now():
+                    overdue_count += 1
+            except Exception:
+                pass
+
+    completion_pct = round(done / total * 100, 1) if total else 0
+    confidence = max(0, min(100, completion_pct - overdue_count * 5 - priority_dist.get('Critical', 0) * 8))
+    payload = {
+        'project_key': project_key,
+        'project_name': project_key,
+        'total_issues': total,
+        'completed': done,
+        'in_progress': in_prog,
+        'todo': todo,
+        'overdue_count': overdue_count,
+        'completion_pct': completion_pct,
+        'confidence': round(confidence, 1),
+        'priority_dist': priority_dist,
+        'last_updated': datetime.utcnow().strftime('%d %b %Y, %H:%M UTC'),
+        'label': share.label,
+        'expires_at': share.expires_at.isoformat() if share.expires_at else None
+    }
+
+    if share.show_risks:
+        risks = []
+        for issue in issues:
+            fields = issue.get('fields', {})
+            score = RiskAnalyzer.calculate_risk_score(issue)
+            if score >= 55:
+                risks.append({
+                    'key': issue.get('key'),
+                    'summary': fields.get('summary', ''),
+                    'priority': fields.get('priority', {}).get('name', 'Medium'),
+                    'score': score,
+                    'impact': RiskAnalyzer.get_impact(score)
+                })
+        payload['top_risks'] = sorted(risks, key=lambda x: -x['score'])[:5]
+
+    if share.show_team:
+        team = {}
+        for issue in issues:
+            fields = issue.get('fields', {})
+            assignee = (fields.get('assignee') or {}).get('displayName', 'Unassigned')
+            team[assignee] = team.get(assignee, 0) + 1
+        payload['team_workload'] = [{'name': k, 'count': v} for k, v in sorted(team.items(), key=lambda x: -x[1])]
+
+    return jsonify(payload), 200
 
 
 # ===== HEALTH + API INFO =====
