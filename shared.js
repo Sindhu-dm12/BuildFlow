@@ -1,12 +1,4 @@
 // shared.js — injected into every page
-// Keep a single host identity so auth cookies do not split across 127.0.0.1/localhost.
-(function enforceCanonicalHost() {
-    if (window.location.hostname === '127.0.0.1') {
-        const target = `http://localhost${window.location.port ? `:${window.location.port}` : ''}${window.location.pathname}${window.location.search}${window.location.hash}`;
-        window.location.replace(target);
-    }
-})();
-
 const API_BASE = window.location.origin + '/api';
 
 const NAV_ITEMS = [
@@ -49,7 +41,7 @@ function buildSidebar(activePage) {
 async function initPage(activePage) {
     buildSidebar(activePage);
     try {
-        const r = await fetch(`${API_BASE}/auth/me`, { credentials: 'include' });
+        const r = await fetch(`${API_BASE}/auth/me`);
         if (!r.ok) { window.location.href = '/index.html'; return null; }
         const { user } = await r.json();
         const nameEl = document.getElementById('sidebarUsername');
@@ -67,14 +59,14 @@ async function initPage(activePage) {
 }
 
 async function doLogout() {
-    await fetch(`${API_BASE}/auth/logout`, { method: 'POST', credentials: 'include' });
+    await fetch(`${API_BASE}/auth/logout`, { method: 'POST' });
     window.location.href = '/index.html';
 }
 
 // Populate project selects
 async function loadProjects(selectId, onSelect) {
     try {
-        const r = await fetch(`${API_BASE}/jira/projects`, { credentials: 'include' });
+        const r = await fetch(`${API_BASE}/jira/projects`);
         if (!r.ok) return;
         const { projects, mock_mode } = await r.json();
         const sel = document.getElementById(selectId);

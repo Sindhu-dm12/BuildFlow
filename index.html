@@ -293,12 +293,6 @@
     </div>
 
     <script>
-        // Keep login and app pages on the same host (localhost) for stable session cookies.
-        if (window.location.hostname === '127.0.0.1') {
-            const target = `http://localhost${window.location.port ? `:${window.location.port}` : ''}${window.location.pathname}${window.location.search}${window.location.hash}`;
-            window.location.replace(target);
-        }
-
         const API_BASE = window.location.origin + '/api';
 
         function switchTab(tab) {
@@ -323,7 +317,6 @@
                 const res = await fetch(`${API_BASE}/auth/login`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    credentials: 'include',
                     body: JSON.stringify({
                         username: document.getElementById('loginUsername').value,
                         password: document.getElementById('loginPassword').value
@@ -355,7 +348,6 @@
                 const res = await fetch(`${API_BASE}/auth/register`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    credentials: 'include',
                     body: JSON.stringify({
                         username: document.getElementById('regUsername').value,
                         email: document.getElementById('regEmail').value,
@@ -377,7 +369,7 @@
         }
 
         // Auto-redirect if already logged in
-        fetch(`${API_BASE}/auth/me`, { credentials: 'include' }).then(r => { if (r.ok) window.location.href = '/dashboard.html'; }).catch(() => {});
+        fetch(`${API_BASE}/auth/me`).then(r => { if (r.ok) window.location.href = '/dashboard.html'; }).catch(() => {});
     </script>
 </body>
 </html>

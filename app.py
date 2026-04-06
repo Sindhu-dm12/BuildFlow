@@ -42,15 +42,6 @@ login_manager = LoginManager(app)
 login_manager.login_view = 'serve_index'
 
 
-@login_manager.unauthorized_handler
-def handle_unauthorized():
-    # API callers must receive 401 JSON, not HTML redirects, otherwise
-    # frontend auth checks can mis-detect session state and bounce pages.
-    if request.path.startswith('/api/'):
-        return jsonify({'error': 'Unauthorized', 'code': 401}), 401
-    return redirect('/')
-
-
 # ===== DATABASE MODELS =====
 
 class User(UserMixin, db.Model):
